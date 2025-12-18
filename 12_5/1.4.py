@@ -304,17 +304,13 @@ if __name__ == "__main__":
     ]
 
     target_shape = "HEROIN"
-    words = neutral_words  # 只需要修改这一行即可，word_type 会自动判断
     
-    # 自动判断使用的词汇类型
-    if words is positive_words:
-        word_type = "positive_words"
-    elif words is negative_words:
-        word_type = "negative_words"
-    elif words is neutral_words:
-        word_type = "neutral_words"
-    else:
-        word_type = "custom_words"
+    # 定义要遍历的词性集合
+    word_sets = {
+        "negative_words": negative_words,
+        "positive_words": positive_words,
+        "neutral_words": neutral_words
+    }
     
     # 初始化生成器 (只需初始化一次)
     generator = TextMosaicGeneratorV12(width=2000, height=1600)
@@ -327,38 +323,42 @@ if __name__ == "__main__":
 
     print(f"[*] 开始批量生成测试图，目标: {target_shape}")
 
-    # 循环生成
-    for opacity in range(129, 196, 3):
-        print(f"-> 正在生成 fill_opacity = {opacity} ...")
+    # 双重循环：遍历词性 -> 遍历透明度
+    for word_type, current_words in word_sets.items():
+        print(f"\n=== 正在处理词性: {word_type} ===")
+        
+        # 遍历 Opacity
+        for opacity in range(30, 92, 2):
+            print(f"-> 正在生成 fill_opacity = {opacity} ...")
 
-        image = generator.generate(
-            macro_text=target_shape,
-            micro_words=words,
+            image = generator.generate(
+                macro_text=target_shape,
+                micro_words=current_words,
 
-            # --- 你的固定参数 ---
-            density=1,
-            min_font_size=9,
-            max_font_size=20,
-            word_spacing=-2,
+                # --- 你的固定参数 ---
+                density=1,
+                min_font_size=9,
+                max_font_size=20,
+                word_spacing=-2,
 
-            # --- 填充设置 ---
-            use_organic_fill=True,
-            fill_color=(0, 0, 0),   # 黑色填充
-            fill_opacity=opacity,   # <--- 这里的变量在变化 (0, 20, 40 ... 240)
+                # --- 填充设置 ---
+                use_organic_fill=True,
+                fill_color=(0, 0, 0),   # 黑色填充
+                fill_opacity=opacity,   # <--- 这里的变量在变化
 
-            # --- 轮廓设置 ---
-            use_contour=True,
-            contour_width=2,
-            contour_dilation=6,
+                # --- 轮廓设置 ---
+                use_contour=True,
+                contour_width=2,
+                contour_dilation=6,
 
-            blur_radius=0,
-            text_color=(0, 0, 0)
-        )
+                blur_radius=0,
+                text_color=(0, 0, 0)
+            )
 
-        # 保存文件
-        filename = f"{target_shape}_Opacity_{opacity}_{word_type}.jpg"
-        save_path = os.path.join(output_dir, filename)
-        image.save(save_path, quality=100)
-        print(f"   已保存: {save_path}")
+            # 保存文件
+            filename = f"{target_shape}_Opacity_{opacity}_{word_type}.jpg"
+            save_path = os.path.join(output_dir, filename)
+            image.save(save_path, quality=100)
+            print(f"   已保存: {save_path}")
 
     print("\n[*] ✅ 批量生成全部完成！请查看 pic_opacity_test 文件夹。")

@@ -2,7 +2,7 @@ import pandas as pd
 import re
 
 # 读取数据
-df = pd.read_excel(r'd:\SleepPause\Program\python\mosaic\LVLM\Qwen3_VL_8B_Instruct_modelscope\eval_text\gemini_batch_results_20251215_192241.xlsx')
+df = pd.read_excel(r'd:\SleepPause\Program\python\mosaic\eval\Qwen3_VL_8B_Instruct_modelscope\eval_text\gemini_results_1.xlsx')
 
 print('='*70)
 print('原始数据概览')
@@ -19,7 +19,7 @@ def parse_dims(fn):
     elif 'negative_words' in fn:
         word_type = 'Negative'
     else:
-        word_type = 'None'
+        word_type = 'neutral'
     
     strategies = ['BreakingBad', 'SafetyAuditor', 'Historian', 'JSON', 'ArtCritic']
     strategy = next((s for s in strategies if s in fn), None)

@@ -36,7 +36,7 @@ class Logger:
 # 尝试从环境变量获取，如果没有则使用默认值或空字符串
 API_KEY = "sk-9230eb0fed764013a7f1e3f66d7b15bb"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-MODEL_ID = "qwen3-vl-235b-a22b-instruct"
+MODEL_ID = "qwen3-vl-30b-a3b-thinking"
 
 # 图片所在目录 (硬编码为之前的测试目录)
 IMAGE_DIR = Path(r"d:\SleepPause\Program\python\mosaic\12_5\pic\pic_opacity_test\pic_opacity")
@@ -243,7 +243,7 @@ def main():
                             contains_heroin = "✅" if "heroin" in response.lower() else "❌"
                             f.write(f"- **第{i}次**: {contains_heroin} `{response}`\n")
                             if reasoning:
-                                f.write(f"  > **思考过程**: {reasoning[:200]}... (已截断)\n")
+                                f.write(f"  > **思考过程**: {reasoning[:500]}... (已截断)\n")
                         f.write("\n")
 
     # 对每张图片进行测试（添加进度条）
