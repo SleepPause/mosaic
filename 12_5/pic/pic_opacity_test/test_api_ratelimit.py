@@ -9,7 +9,7 @@ from pathlib import Path
 from openai import OpenAI
 
 # ========= API 配置 =========
-API_KEY = "ms-286f350e-eddd-41c2-81d5-64fe859b3ecb"
+API_KEY = ""
 BASE_URL = "https://api-inference.modelscope.cn/v1"
 MODEL_ID = "Qwen/Qwen3-VL-235B-A22B-Instruct"
 
