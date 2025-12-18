@@ -34,7 +34,7 @@ class Logger:
 
 # ========= API 配置 =========
 # 尝试从环境变量获取，如果没有则使用默认值或空字符串
-API_KEY = "sk-9230eb0fed764013a7f1e3f66d7b15bb"
+API_KEY = ""
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_ID = "qwen3-vl-30b-a3b-thinking"
 
