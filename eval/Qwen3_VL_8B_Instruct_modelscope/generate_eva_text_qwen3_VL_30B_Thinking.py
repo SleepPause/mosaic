@@ -15,7 +15,7 @@ import prompt_strategies  # 导入提示词库
 import evaluation_templates # 导入评估模板库
 
 # ========= 用户配置区域 =========
-API_KEY = "sk-9230eb0fed764013a7f1e3f66d7b15bb"
+API_KEY = ""
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_ID = "qwen3-vl-30b-a3b-thinking"
 
