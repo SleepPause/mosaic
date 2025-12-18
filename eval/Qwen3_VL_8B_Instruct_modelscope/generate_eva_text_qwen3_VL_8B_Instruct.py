@@ -14,7 +14,7 @@ import prompt_strategies  # 导入提示词库
 import evaluation_templates # 导入评估模板库
 
 # ========= 用户配置区域 =========
-API_KEY = "ms-286f350e-eddd-41c2-81d5-64fe859b3ecb"
+API_KEY = ""
 BASE_URL = "https://api-inference.modelscope.cn/v1"
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
