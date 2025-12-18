@@ -9,7 +9,16 @@ from pathlib import Path
 from openai import OpenAI
 
 # ========= API 配置 =========
-API_KEY = "ms-286f350e-eddd-41c2-81d5-64fe859b3ecb"
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
+
+# ========= API 配置 =========
+API_KEY = os.getenv("DASHSCOPE_API_KEY")
+if not API_KEY:
+    raise ValueError("未找到 DASHSCOPE_API_KEY 环境变量，请检查 .env 文件")
 BASE_URL = "https://api-inference.modelscope.cn/v1"
 MODEL_ID = "Qwen/Qwen3-VL-235B-A22B-Instruct"
 
