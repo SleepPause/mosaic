@@ -27,11 +27,7 @@ class Logger:
 # ================= 配置区域 =================
 # 支持多个 API Key，自动轮询
 GEMINI_API_KEYS = [
-    "AIzaSyBjQfkBprxozgU6Rn4RliHmeIAuJaRXntQ", #1111
-    "AIzaSyCSSA6_d90bj6yoIv31Od1UnFU8h0xFikI", #2222
-    "AIzaSyCMKr49yFZhnCgo9JHh0jwIop46_Df2JXY", #3333
-    "AIzaSyDKgBelQY6LGeFLvej-lB4QVA2NUchsNTk", #4444
-    "AIzaSyAiJuM3cHFK_O4_cezJD8S8RNjX7-X9hKk"  #mwx183
+
 ]
 
 # 模型列表，支持自动降级/切换
