@@ -39,7 +39,7 @@ MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 # 使用脚本所在目录作为基准，防止在不同目录下运行时找不到文件
 BASE_DIR = Path(__file__).parent
 PIC_DIR = BASE_DIR.parent / "pic"
-OUT_DIR = BASE_DIR / "eval_text_native"
+OUT_DIR = BASE_DIR / "eval_text"
 
 # 定义要测试的策略集合
 STRATEGIES = {

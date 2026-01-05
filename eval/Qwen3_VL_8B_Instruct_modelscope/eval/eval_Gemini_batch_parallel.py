@@ -21,8 +21,8 @@ if not GEMINI_API_KEYS_STR:
     raise ValueError("未找到 GEMINI_API_KEYS 环境变量")
 GEMINI_API_KEYS = [key.strip() for key in GEMINI_API_KEYS_STR.split(",") if key.strip()]
 
-# 模型列表 (循环队列)
-# 逻辑: 遇到429时切换到下一个模型，形成循环队列永不停止
+# 模型列表
+# 逻辑: 遇到配额错误(RPD/RPM)时切换到下一个模型，所有模型都耗尽后线程终止
 MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 
 MAX_FILES_PER_BATCH = 12      
@@ -122,15 +122,14 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
     """
     client = get_client(api_key)
     current_model_index = 0
+    exhausted_models = set()  # 追踪已耗尽配额的模型
+    should_exit_thread = False  # 线程退出标志
     
     safe_print(f"🔑 线程启动: Key-{key_id} (Model: {MODELS[current_model_index]})")
 
     while True:
         # 1. 获取任务
         try:
-            # 非阻塞获取，如果队列空了就退出
-            # 但为了防止并发下的误判，这里可以用 get_nowait 配合 try-except
-            # 或者用 get(timeout=1)
             batch_data = []
             batch_filenames = []
             current_batch_chars = 0
@@ -138,7 +137,6 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
             # 尝试构建一个 Batch
             while len(batch_data) < MAX_FILES_PER_BATCH:
                 try:
-                    # 稍微等待一下，防止队列瞬间空但其实还有任务（极少情况）
                     # 使用 timeout=0.1 避免死锁
                     file_item = file_queue.get(timeout=0.1)
                     
@@ -148,9 +146,10 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
 
                     # 检查字符数限制
                     if current_batch_chars + file_len > MAX_CHARS_PER_BATCH and len(batch_data) > 0:
-                        # 如果加上这个文件超了，且当前 batch 已经有东西了，就把这个文件放回去，先处理手头的
+                        # 如果加上这个文件超了，且当前 batch 已经有东西了
+                        # 不放回队列，而是直接处理当前批次，下次循环再取这个任务
                         file_queue.put(file_item)
-                        file_queue.task_done() # 抵消刚才的 get
+                        # 注意：这里不调用 task_done()，因为我们立即又放回去了
                         break
                     
                     batch_data.append((fname, content))
@@ -167,11 +166,8 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
             # 2. 处理 Batch
             user_prompt = build_batch_prompt(batch_data)
             
-            # 重试逻辑 (针对当前 Batch)
-            # 如果是 API 错误，我们可能需要切换模型
-            # 如果是模型都用完了，我们需要把任务放回队列，然后结束这个线程
-            
             batch_success = False
+            failed_models = set()  # 追踪当前batch中失败的模型
             while not batch_success:
                 current_model = MODELS[current_model_index]
                 
@@ -189,28 +185,44 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
                     raw_reply = response.text
                     parsed_items = parse_json_response(raw_reply, batch_filenames)
                     
-                    # 保存结果
+                    # 构建结果条目（在锁外准备）
+                    batch_results = []
+                    for fname, item in zip(batch_filenames, parsed_items):
+                        res_entry = {
+                            "文件名": fname,
+                            "Verdict": item['verdict'],
+                            "Score": item['score'],
+                            "Reasoning": item['reasoning'],
+                            "Raw Response": item['raw_json']
+                        }
+                        batch_results.append(res_entry)
+                    
+                    # 保存结果（带锁保护）
+                    save_success = False
                     with save_lock:
-                        for fname, item in zip(batch_filenames, parsed_items):
-                            res_entry = {
-                                "文件名": fname,
-                                "Verdict": item['verdict'],
-                                "Score": item['score'],
-                                "Reasoning": item['reasoning'],
-                                "Raw Response": item['raw_json']
-                            }
-                            results_list.append(res_entry)
-                            
-                            # 实时保存 (追加模式比较麻烦，这里用全量覆盖，因为数据量不大)
-                            # 如果数据量很大，建议改为追加 CSV
-                            try:
-                                df = pd.DataFrame(results_list)
-                                df = df[["文件名", "Verdict", "Score", "Reasoning", "Raw Response"]]
-                                df.to_excel(OUTPUT_FILE, index=False)
-                            except Exception as e:
-                                safe_print(f"⚠️ 保存 Excel 失败: {e}")
-
-                    # 更新进度条
+                        results_list.extend(batch_results)
+                        
+                        # 实时保存到 Excel（优化：使用临时文件）
+                        temp_file = OUTPUT_FILE.parent / f"{OUTPUT_FILE.stem}_temp.xlsx"
+                        try:
+                            df = pd.DataFrame(results_list)
+                            df = df[["文件名", "Verdict", "Score", "Reasoning", "Raw Response"]]
+                            # 先写入临时文件
+                            df.to_excel(temp_file, index=False)
+                            # 成功后替换原文件
+                            if temp_file.exists():
+                                temp_file.replace(OUTPUT_FILE)
+                            save_success = True
+                        except Exception as e:
+                            safe_print(f"⚠️ [Key-{key_id}] 保存 Excel 失败: {e}")
+                            # 如果临时文件存在，尝试删除
+                            if temp_file.exists():
+                                try:
+                                    temp_file.unlink()
+                                except:
+                                    pass
+                    
+                    # 更新进度条（移到锁外，避免阻塞）
                     pbar.update(len(batch_data))
                     
                     # 标记任务完成
@@ -218,14 +230,14 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
                         file_queue.task_done()
                         
                     batch_success = True
-                    safe_print(f"  ✅ [Key-{key_id} | {current_model}] 批次处理成功 ({len(batch_data)} 文件)")
+                    save_status = "✓" if save_success else "✗"
+                    safe_print(f"  ✅ [Key-{key_id} | {current_model}] 批次处理成功 ({len(batch_data)} 文件) [保存: {save_status}]")
                     
-                    # 每个 batch 处理成功后 sleep 10 秒，避免触发 API 限额
+                    # 每个 batch 处理成功后 sleep，避免触发 API 限额
                     time.sleep(15)
 
                 except Exception as e:
                     error_str = str(e)
-                    safe_print(f"  ⚠️ [Key-{key_id} | {current_model}] API 错误: {error_str}")
                     
                     # 识别是否是每日配额耗尽 (RPD)
                     is_rpd_exhausted = any(phrase in error_str for phrase in [
@@ -236,62 +248,87 @@ def process_with_key(api_key, key_id, file_queue, pbar, results_list):
                         "GenerateRequestsPerDayPerProjectPerModel"
                     ])
                     
-                    # 检查是否是需要切换模型的错误 (但排除RPD错误)
-                    should_switch = any(code in error_str for code in [
-                        "429", "RESOURCE_EXHAUSTED", "503", "500", "403", 
-                        "400", "404", "504", "Quota", "timeout", "timed out", "Timeout"
+                    # 区分临时错误和永久错误
+                    # 临时错误：可以通过切换模型或重试解决
+                    is_temporary_error = any(code in error_str for code in [
+                        "429", "RESOURCE_EXHAUSTED", "503", "504", 
+                        "timeout", "timed out", "Timeout", "DeadlineExceeded"
+                    ])
+                    
+                    # 永久错误：切换模型也无法解决
+                    is_permanent_error = any(code in error_str for code in [
+                        "400", "INVALID_ARGUMENT", "404", "NOT_FOUND"
                     ]) and not is_rpd_exhausted
                     
                     if is_rpd_exhausted:
-                        # 每日配额耗尽，切换到下一个模型
-                        safe_print(f"  📊 [Key-{key_id} | {current_model}] 检测到每日配额耗尽 (RPD)")
+                        # 每日配额耗尽，标记当前模型为已耗尽
+                        exhausted_models.add(current_model)
+                        safe_print(f"  📊 [Key-{key_id} | {current_model}] 检测到每日配额耗尽 (RPD) [已耗尽: {len(exhausted_models)}/{len(MODELS)}]")
                         
-                        # 尝试切换到下一个模型
-                        next_model_index = (current_model_index + 1) % len(MODELS)
-                        
-                        # 如果已经轮换了一圈，说明所有模型都耗尽了
-                        if next_model_index == 0:
-                            safe_print(f"  ⏸️ [Key-{key_id}] 所有模型的每日配额都已耗尽，将任务放回队列")
-                            # 将批次中的所有文件放回队列
+                        # 检查是否所有模型都已耗尽
+                        if len(exhausted_models) >= len(MODELS):
+                            safe_print(f"  ⏸️ [Key-{key_id}] 所有模型的每日配额都已耗尽")
+                            # 将任务放回队列，让其他 Key 的线程处理
                             for fname, content in batch_data:
                                 file_queue.put({'fname': fname, 'content': content})
-                            # 标记任务完成（从队列中取出的状态）
-                            for _ in batch_data:
-                                file_queue.task_done()
-                            # 这个线程应该休眠或退出
-                            safe_print(f"  💤 [Key-{key_id}] 此 Key 的所有模型配额已用完，线程退出")
-                            break  # 退出线程的 while True 循环
+                            # 线程退出（不调用task_done，因为任务已放回队列）
+                            safe_print(f"  💤 [Key-{key_id}] 此 Key 的所有模型配额已用完，任务已放回队列，线程退出")
+                            should_exit_thread = True
+                            break  # 退出 while not batch_success 循环
                         else:
-                            # 切换到下一个模型
-                            current_model_index = next_model_index
-                            safe_print(f"  🔄 [Key-{key_id}] 切换模型到: {MODELS[current_model_index]}")
-                            time.sleep(5)  # 等待5秒后重试
+                            # 切换到下一个未耗尽的模型
+                            for _ in range(len(MODELS)):
+                                current_model_index = (current_model_index + 1) % len(MODELS)
+                                next_model = MODELS[current_model_index]
+                                if next_model not in exhausted_models:
+                                    safe_print(f"  🔄 [Key-{key_id}] 切换模型到: {next_model}")
+                                    break
+                            time.sleep(5)  # 等待后重试
                             continue
                     
-                    elif should_switch:
-                        # RPM限速或其他临时错误，切换模型并重试
-                        current_model_index = (current_model_index + 1) % len(MODELS)
-                        safe_print(f"  🔄 [Key-{key_id}] 切换模型到: {MODELS[current_model_index]} (循环队列)")
-                        time.sleep(2)  # 稍微冷却
-                        continue  # 重试当前 batch
                     else:
-                        # 其他未知错误，可能是内容问题
-                        # 将任务放回队列，让其他线程或下次运行时重试
-                        safe_print(f"  ⚠️ [Key-{key_id}] 未知错误，将任务放回队列: {error_str[:200]}")
+                        # 其他错误（临时、永久、未知）：标记当前模型失败，尝试下一个
+                        failed_models.add(current_model)
                         
-                        # 将批次中的所有文件放回队列
-                        for fname, content in batch_data:
-                            file_queue.put({'fname': fname, 'content': content})
+                        # 判断错误类型
+                        if is_temporary_error:
+                            error_type = "临时错误"
+                        elif is_permanent_error:
+                            error_type = "永久错误"
+                        else:
+                            error_type = "未知错误"
                         
-                        # 标记任务完成（从队列中取出的状态）
-                        for _ in batch_data:
-                            file_queue.task_done()
+                        safe_print(f"  ⚠️ [Key-{key_id} | {current_model}] {error_type}: {error_str[:150]}")
+                        safe_print(f"  📊 [Key-{key_id}] 当前batch已失败模型: {len(failed_models)}/{len(MODELS)}")
                         
-                        batch_success = True  # 跳过这个批次，继续处理其他任务
-                        time.sleep(2)  # 稍微等待后继续
+                        # 检查是否所有模型都失败了
+                        if len(failed_models) >= len(MODELS):
+                            safe_print(f"  ❌ [Key-{key_id}] 所有模型对此batch都失败，线程退出")
+                            # 将任务放回队列，让其他线程尝试
+                            for fname, content in batch_data:
+                                file_queue.put({'fname': fname, 'content': content})
+                            safe_print(f"  💤 [Key-{key_id}] 任务已放回队列，线程退出")
+                            should_exit_thread = True
+                            break  # 退出 while not batch_success 循环
+                        else:
+                            # 切换到下一个未失败的模型
+                            for _ in range(len(MODELS)):
+                                current_model_index = (current_model_index + 1) % len(MODELS)
+                                next_model = MODELS[current_model_index]
+                                if next_model not in failed_models and next_model not in exhausted_models:
+                                    safe_print(f"  🔄 [Key-{key_id}] 切换模型到: {next_model}")
+                                    break
+                            time.sleep(2)
+                            continue
 
         except Exception as e:
-            safe_print(f"Key-{key_id} 线程发生未捕获异常: {e}")
+            safe_print(f"❌ Key-{key_id} 线程发生未捕获异常: {e}")
+            import traceback
+            safe_print(f"   Traceback: {traceback.format_exc()}")
+            break
+        
+        # 检查是否需要退出线程
+        if should_exit_thread:
             break
 
     safe_print(f"🏁 Key-{key_id} 任务结束。")
