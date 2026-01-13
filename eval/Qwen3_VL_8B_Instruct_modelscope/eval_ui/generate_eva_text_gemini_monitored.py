@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 批量红队评估：遍历 pic/内所有图片，使用多种提示词策略截取模型的回答
-使用 Gemini 原生 API 实现（多线程并发版本，支持 thinking）
+使用 Gemini 原生 API 实现（多线程并发版本，支持 thinking，带监控）
 文件名：图片名_策略名_序号_gemini_时间戳.txt
+
+注意：此版本集成了监控服务，需配合 ws_server.py 使用
 """
 import time
 import re
@@ -24,6 +26,9 @@ from concurrent.futures import ThreadPoolExecutor
 from google import genai
 from google.genai import types
 
+# 导入监控服务
+from monitor_service import monitor
+
 load_dotenv()
 
 # ========= 用户配置区域 =========
@@ -38,8 +43,8 @@ MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 # 使用脚本所在目录作为基准，防止在不同目录下运行时找不到文件
 BASE_DIR = Path(__file__).parent
-PIC_DIR = BASE_DIR.parent / "pic"
-OUT_DIR = BASE_DIR / "eval_text"
+PIC_DIR = BASE_DIR.parent / "pic"  # 注意：eval_ui 是子文件夹，需要向上两级
+OUT_DIR = BASE_DIR.parent / "eval" / "eval_text"  # 输出到原位置
 
 # 定义要测试的策略集合
 STRATEGIES = {
@@ -342,6 +347,7 @@ def process_with_key(api_key, key_id, task_queue, pbar):
     client = get_client(api_key)
     current_model_index = 0
     consecutive_failures = 0
+    thread_stopped = False  # 标记线程是否已停止（防止重复调用 monitor）
     
     # 线程启动 - 增加活跃线程计数
     with active_threads_lock:
@@ -350,10 +356,13 @@ def process_with_key(api_key, key_id, task_queue, pbar):
     
     log_and_print(f"🔑 Key-{key_id} 启动（当前活跃线程: {current_active}）", console=True)
     
+    # 注册线程到监控服务（在 main 函数中统一注册，这里不重复）
+    
     while True:
         # 检查是否需要优雅退出
         if stop_flag:
             log_and_print(f"[Key-{key_id}] 接收到停止信号，优雅退出", console=True)
+            monitor.mark_thread_stopped(key_id, '用户中断')
             break
         
         task = None
@@ -363,6 +372,7 @@ def process_with_key(api_key, key_id, task_queue, pbar):
             # 检查是否达到失败阈值
             if consecutive_failures >= THREAD_FAILURE_THRESHOLD:
                 log_and_print(f"💀 [Key-{key_id}] 连续失败 {consecutive_failures} 次，关闭线程", console=True)
+                monitor.mark_thread_stopped(key_id, f'连续失败{consecutive_failures}次')
                 break
             
             # 从队列获取任务
@@ -370,6 +380,7 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                 task = task_queue.get(timeout=0.1)
                 task_acquired = True
             except queue.Empty:
+                monitor.mark_thread_stopped(key_id, '队列已空')
                 break
             
             img_path = task['img_path']
@@ -383,10 +394,13 @@ def process_with_key(api_key, key_id, task_queue, pbar):
             existing_files = list(OUT_DIR.glob(f"{file_prefix}_*.txt"))
             
             if existing_files:
-                log_and_print(f"[Key-{key_id}] 跳过: {img_name} | {strat_name} | 第{repeat_index}次 (已存在)")
+                # 跳过文件只输出到控制台，不写入日志（避免断点续传时日志过大）
+                # log_and_print(f"[Key-{key_id}] 跳过: {img_name} | {strat_name} | 第{repeat_index}次 (已存在)")
                 with stats_lock:
                     stats['skipped'] += 1
                 pbar.update(1)
+                # 更新监控：跳过任务
+                monitor.update_task_complete(key_id, success=False, skipped=True)
                 task_queue.task_done()
                 continue
             
@@ -397,6 +411,9 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                 
                 # 获取当前使用的模型
                 current_model = MODELS[current_model_index]
+                
+                # 更新监控：任务开始
+                monitor.update_task_start(key_id, img_name, strat_name, repeat_index)
                 
                 # 调用 API
                 log_and_print(f"[Key-{key_id}|{current_model}] 开始: {img_name} | {strat_name} | 第{repeat_index}次")
@@ -429,11 +446,15 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                             f"✅ [Key-{key_id}] 所有模型配额已用完，线程优雅退出",
                             console=True
                         )
+                        monitor.mark_thread_stopped(key_id, '所有模型配额用尽')
+                        thread_stopped = True
                         task_queue.put(task)
                         task_queue.task_done()
                         break
                     
                     log_and_print(f"[Key-{key_id}] 模型切换: {old_model} → {new_model}", console=True)
+                    # 更新监控：切换模型
+                    monitor.update_model(key_id, new_model)
                     task_queue.put(task)
                     task_queue.task_done()
                     continue
@@ -445,6 +466,9 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                 
                 with stats_lock:
                     stats['failed'] += 1
+                
+                # 更新监控：任务失败
+                monitor.update_task_complete(key_id, success=False, skipped=False)
                 
                 task_queue.put(task)
                 task_queue.task_done()
@@ -486,6 +510,9 @@ def process_with_key(api_key, key_id, task_queue, pbar):
             with stats_lock:
                 stats['completed'] += 1
             
+            # 更新监控：任务成功
+            monitor.update_task_complete(key_id, success=True, skipped=False)
+            
             pbar.update(1)
             task_queue.task_done()
             
@@ -514,6 +541,10 @@ def process_with_key(api_key, key_id, task_queue, pbar):
     with active_threads_lock:
         active_threads -= 1
         remaining = active_threads
+    
+    # 标记线程已停止（避免重复调用）
+    if not thread_stopped:
+        monitor.mark_thread_stopped(key_id)
     
     log_and_print(f"🏁 Key-{key_id} 结束，剩余 {remaining} 个线程在工作", console=True)
 
@@ -574,6 +605,13 @@ def main():
     
     print(f"任务队列已构建，共 {task_queue.qsize()} 个任务\n")
     print(f"[*] 线程失败阈值: {THREAD_FAILURE_THRESHOLD} 次连续失败\n")
+    
+    # 初始化监控服务
+    print(f"[*] 监控面板: http://localhost:9000\n")
+    monitor.reset()
+    for i in range(len(GEMINI_API_KEYS)):
+        monitor.register_thread(i, MODELS[0], len(GEMINI_API_KEYS), total_tasks)
+    monitor.update_queue_size(task_queue.qsize())
     
     # 创建进度条
     pbar = tqdm(total=total_tasks, unit="任务", desc="进度", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')

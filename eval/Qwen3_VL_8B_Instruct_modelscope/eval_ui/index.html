@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini 多线程监控面板</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body class="dark-theme">
+    <!-- 主题切换按钮 -->
+    <button id="theme-toggle" class="theme-toggle" aria-label="切换主题">
+        🌙
+    </button>
+
+    <!-- 主容器 -->
+    <div class="container">
+        <!-- 顶部标题 -->
+        <header class="header">
+            <h1>📊 Gemini 多线程任务监控面板</h1>
+            <div class="connection-status" id="connection-status">
+                <span class="status-dot"></span>
+                <span class="status-text">连接中...</span>
+            </div>
+        </header>
+
+        <!-- 全局统计面板 -->
+        <section class="global-panel">
+            <div class="progress-section">
+                <div class="progress-header">
+                    <span class="progress-label">总体进度</span>
+                    <span class="progress-percentage" id="progress-percentage">0%</span>
+                </div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+                <div class="progress-details">
+                    <span id="progress-details">0 / 0</span>
+                </div>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🟢</div>
+                    <div class="stat-content">
+                        <div class="stat-label">活跃线程</div>
+                        <div class="stat-value">
+                            <span id="active-threads">0</span> / <span id="total-threads">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-icon">📋</div>
+                    <div class="stat-content">
+                        <div class="stat-label">队列剩余</div>
+                        <div class="stat-value" id="queue-size">0</div>
+                    </div>
+                </div>
+
+                <div class="stat-card success">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-content">
+                        <div class="stat-label">已完成</div>
+                        <div class="stat-value" id="completed">0</div>
+                    </div>
+                </div>
+
+                <div class="stat-card warning">
+                    <div class="stat-icon">⏭️</div>
+                    <div class="stat-content">
+                        <div class="stat-label">已跳过</div>
+                        <div class="stat-value" id="skipped">0</div>
+                    </div>
+                </div>
+
+                <div class="stat-card error">
+                    <div class="stat-icon">❌</div>
+                    <div class="stat-content">
+                        <div class="stat-label">失败次数</div>
+                        <div class="stat-value" id="failed">0</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 线程卡片网格 -->
+        <section class="threads-section">
+            <h2 class="section-title">线程状态</h2>
+
+            <!-- 状态过滤器 -->
+            <div class="filter-section">
+                <label class="filter-checkbox">
+                    <input type="checkbox" id="filter-working" checked>
+                    <span>🟢 工作中 <span class="filter-count" id="count-working">(0)</span></span>
+                </label>
+                <label class="filter-checkbox">
+                    <input type="checkbox" id="filter-waiting" checked>
+                    <span>🟡 等待中 <span class="filter-count" id="count-waiting">(0)</span></span>
+                </label>
+                <label class="filter-checkbox">
+                    <input type="checkbox" id="filter-stopped" checked>
+                    <span>🔴 已停止 <span class="filter-count" id="count-stopped">(0)</span></span>
+                </label>
+            </div>
+
+            <div class="threads-grid" id="threads-grid">
+                <!-- 动态生成线程卡片 -->
+                <div class="empty-state">
+                    <div class="empty-icon">🔄</div>
+                    <p>等待线程启动...</p>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

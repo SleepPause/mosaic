@@ -249,13 +249,18 @@ def get_response(client, text_prompt: str, image_path: Path, model: str, thread_
         # 提取答案和 thinking
         answer = response.choices[0].message.content
         reasoning = getattr(response.choices[0].message, 'reasoning_content', None) or ""
-        
+        finish_reason = response.choices[0].finish_reason
+
         # 记录 thinking 状态
         if reasoning:
             log_and_print(f"[Thread-{thread_id}] ✅ 获取到 thinking 内容，长度: {len(reasoning)} 字符")
         else:
             log_and_print(f"[Thread-{thread_id}] ⚠️ 未获取到 thinking 内容", level='warning')
         
+        if finish_reason in ["content_filter", "safety"]:
+            log_and_print(f"[Thread-{thread_id}] 🛑 任务触发安全拦截 (Reason: {finish_reason})，停止重试。")
+            return "[SAFETY_BLOCKED]", reasoning
+
         # 检查是否为空响应
         if not answer:
             return "API Error: Empty response", ""
