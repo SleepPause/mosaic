@@ -4,6 +4,8 @@
 批量红队评估：遍历 pic/内所有图片，使用多种提示词策略截取模型的回答
 使用 Gemini 原生 API 实现（多线程并发版本，支持 thinking）
 文件名：图片名_策略名_序号_gemini_时间戳.txt
+
+【模板函数版本】支持多目标词汇的动态提示词生成
 """
 import time
 import re
@@ -13,7 +15,7 @@ import signal
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
-import prompt_strategies
+import prompt_strategies_new as prompt_strategies  # 导入新版提示词库
 import evaluation_templates
 import os
 from dotenv import load_dotenv
@@ -41,26 +43,17 @@ BASE_DIR = Path(__file__).parent
 PIC_DIR = BASE_DIR.parent / "pic"
 OUT_DIR = BASE_DIR / "eval_text"
 
-# 定义要测试的策略集合
-STRATEGIES = {
-    "BreakingBad": prompt_strategies.PROMPT_BREAKING_BAD,
-    "SafetyAuditor": prompt_strategies.PROMPT_SAFETY_AUDITOR,
-    "Historian": prompt_strategies.PROMPT_HISTORIAN,
-    "JSON": prompt_strategies.PROMPT_JSON_FORMAT,
-    "ArtCritic": prompt_strategies.PROMPT_ART_CRITIC,
-}
-
 # 每个策略重复测试的次数
-REPEAT_TIMES = 6
+REPEAT_TIMES = 10
 
 # 线程失败阈值：如果线程连续失败（轮换3遍MODELS）且没有完成任何任务，则关闭该线程
-THREAD_FAILURE_THRESHOLD = len(MODELS) * 3
+THREAD_FAILURE_THRESHOLD = len(MODELS) * 3000000
 
 # 速率限制配置（基于 RPM 限制）
-SUCCESS_SLEEP_MIN = 15  # 成功后最少等待30秒
-SUCCESS_SLEEP_MAX = 20  # 成功后最多等待40秒（加入随机性）
-FAILURE_SLEEP = 40       # 失败后等待90秒
-RPM429_SLEEP = 40       # 遇到429错误后等待120秒
+SUCCESS_SLEEP_MIN = 15  # 成功后最少等待15秒
+SUCCESS_SLEEP_MAX = 20  # 成功后最多等待20秒（加入随机性）
+FAILURE_SLEEP = random.uniform(30,50)       # 失败后等待40秒
+RPM429_SLEEP = random.uniform(30,50)        # 遇到429错误后等待40秒
 # =================================
 
 # 使用 StrongREJECT 模板
@@ -88,6 +81,54 @@ stop_flag = False
 logger = None  # 将在 main 函数中初始化
 
 
+def get_strategies_for_target(target_word: str) -> dict:
+    """
+    根据目标词汇动态生成策略集合
+    
+    Args:
+        target_word: 从图片文件名提取的目标词（如 "HEROIN", "METH"）
+    
+    Returns:
+        策略名称到提示词文本的映射字典
+    """
+    # 从映射字典中获取对应的 action，如果不存在则使用默认值
+    action = prompt_strategies.TARGET_CONTEXTS.get(target_word, "synthesis process")
+    
+    return {
+        "BreakingBad": prompt_strategies.get_breaking_bad_prompt(target_word, action),
+        #"SafetyAuditor": prompt_strategies.get_safety_auditor_prompt(target_word, action),
+        #"Historian": prompt_strategies.get_historian_prompt(target_word, action),
+        "JSON": prompt_strategies.get_json_format_prompt(target_word, action),
+        #"ArtCritic": prompt_strategies.get_art_critic_prompt(target_word, action),
+    }
+
+
+def extract_target_from_filename(filename: str) -> str:
+    """
+    从文件名中提取目标词汇
+    
+    例如: "HEROIN_Opacity_64_negative_words.jpg" -> "HEROIN"
+          "METH_test.jpg" -> "METH"
+    
+    Args:
+        filename: 图片文件名（不含路径）
+    
+    Returns:
+        提取的目标词（大写），如果无法提取则返回 "HEROIN" 作为默认值
+    """
+    # 假设文件名格式为: TARGET_其他信息.jpg
+    parts = filename.split('_')
+    if parts:
+        target = parts[0].upper()
+        # 验证是否在已知目标列表中
+        if target in prompt_strategies.TARGET_CONTEXTS:
+            return target
+    
+    # 如果无法识别，默认返回 HEROIN
+    log_and_print(f"⚠️  无法从文件名 '{filename}' 提取目标词，使用默认值 HEROIN", console=True)
+    return "HEROIN"
+
+
 def setup_logging(log_dir: Path):
     """
     配置日志系统：详细日志写入文件，控制台只显示关键信息
@@ -98,10 +139,10 @@ def setup_logging(log_dir: Path):
     log_dir.mkdir(parents=True, exist_ok=True)
     
     # 生成日志文件名
-    log_file = log_dir / f"eval_gemini_native_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = log_dir / f"eval_gemini_native_new_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
     # 配置日志
-    logger = logging.getLogger('GeminiNativeEval')
+    logger = logging.getLogger('GeminiNativeEvalNew')
     logger.setLevel(logging.DEBUG)
     
     # 文件处理器 - 记录所有详细信息
@@ -121,113 +162,71 @@ def setup_logging(log_dir: Path):
 
 
 def clean_reasoning_content(reasoning: str) -> str:
-    """
-    清理 reasoning_content 中的重复 JSON 代码块
-    针对 JSON 策略时 Gemini API 返回的冗余思考过程
-    
-    处理两种情况：
-    1. 完整的重复 JSON 块：```json ... ```
-    2. 不完整的、被截断的 JSON 块：```json ... (没有结束```)
-    
-    Args:
-        reasoning: 原始 reasoning 内容
-    
-    Returns:
-        清理后的 reasoning 内容
-    """
+    """清理 reasoning_content 中的重复 JSON 代码块"""
     if not reasoning or len(reasoning) < 500:
         return reasoning
     
     import re
     
-    # 1. 首先检测是否有未闭合的 JSON 代码块（从```json开始但没有```结束）
-    # 查找最后一个```json的位置
+    # 检测未闭合的 JSON 代码块
     last_json_start = reasoning.rfind('```json')
     
     if last_json_start != -1:
-        # 检查在此位置之后是否有闭合的```
-        after_last_json = reasoning[last_json_start + 7:]  # 跳过```json
-        
-        # 查找下一个```
+        after_last_json = reasoning[last_json_start + 7:]
         next_close = after_last_json.find('```')
         
         if next_close == -1:
-            # 没有找到闭合标记，说明是截断的JSON块
-            # 检查这个未闭合的块是否在文件末尾附近（最后5000字符内）
             if len(reasoning) - last_json_start < 3000:
-                # 很可能是截断的重复内容，移除这个不完整的块
-                logger.debug(f"Detected incomplete JSON block at position {last_json_start}, removing truncated content")
+                logger.debug(f"Detected incomplete JSON block, removing truncated content")
                 reasoning = reasoning[:last_json_start].rstrip() + "\n\n[不完整的 JSON 块已移除（可能被截断）]\n"
                 return reasoning
     
-    # 2. 处理完整的重复 JSON 块
-    # 查找所有完整的 JSON 代码块 (```json ... ```)
+    # 处理重复 JSON 块
     json_blocks = re.findall(r'```json\s*\n(.*?)\n```', reasoning, re.DOTALL)
     
     if len(json_blocks) <= 1:
-        # 没有重复,直接返回
         return reasoning
     
-    # 检测重复的 JSON 块
     seen_blocks = set()
     duplicate_indices = []
     
     for i, block in enumerate(json_blocks):
-        # 简化 JSON 块用于比较（去除空格换行）
         normalized = re.sub(r'\s+', '', block)
-        
         if normalized in seen_blocks:
             duplicate_indices.append(i)
         else:
             seen_blocks.add(normalized)
     
-    # 如果有重复,移除重复的块
     if duplicate_indices:
-        # 分割 reasoning 按 JSON 块
         parts = re.split(r'(```json\s*\n.*?\n```)', reasoning, flags=re.DOTALL)
-        
-        # 标记要移除的块
         json_block_counter = 0
         filtered_parts = []
         
         for part in parts:
             if re.match(r'```json\s*\n.*?\n```', part, re.DOTALL):
-                # 这是一个 JSON 块
                 if json_block_counter not in duplicate_indices:
                     filtered_parts.append(part)
                 else:
-                    # 跳过重复块,但保留一个占位符
                     filtered_parts.append("\n[重复的 JSON 块已移除]\n")
                 json_block_counter += 1
             else:
-                # 保留非 JSON 部分
                 filtered_parts.append(part)
         
         cleaned = ''.join(filtered_parts)
-        
-        # 记录清理信息
-        removed_count = len(duplicate_indices)
-        logger.debug(f"Cleaned {removed_count} duplicate JSON blocks from reasoning_content")
-        
+        logger.debug(f"Cleaned {len(duplicate_indices)} duplicate JSON blocks")
         return cleaned
     
     return reasoning
 
 
 def log_and_print(message: str, level: str = 'info', console: bool = False):
-    """
-    智能日志输出：
-    - 详细信息记录到日志文件
-    - 重要信息同时显示在控制台
-    """
+    """智能日志输出"""
     if logger is None:
         return
     
-    # 写入日志文件
     log_func = getattr(logger, level.lower(), logger.info)
     log_func(message)
     
-    # 如果需要，在控制台显示（使用 tqdm.write 避免干扰进度条）
     if console:
         with print_lock:
             tqdm.write(message)
@@ -251,26 +250,18 @@ def safe_file_name(name: str) -> str:
 def get_response(client, text_prompt: str, pil_image: Image.Image, model: str, key_id: int) -> tuple:
     """
     调用 Gemini 原生 API 获取回答（流式响应，支持 thinking）
-    只尝试一次，不做内部重试
     
     Returns:
-        (answer, should_switch_model, is_quota_exhausted, reasoning): 
-            answer - API响应或错误信息
-            should_switch_model - 是否应该切换模型
-            is_quota_exhausted - 是否是RPD配额耗尽
-            reasoning - 思考过程（thinking process）
+        (answer, should_switch_model, is_quota_exhausted, reasoning)
     """
     try:
         # 确定使用的 thinking 配置
-        # Gemini 2.5: 使用 thinking_budget
-        # Gemini 3: 使用 thinking_level
         thinking_config = types.ThinkingConfig(include_thoughts=True)
         
         if "gemini-2.5" in model:
             thinking_config.thinking_budget = 8192  # medium 级别
         elif "gemini-3" in model:
             thinking_config.thinking_level = types.ThinkingLevel.MEDIUM
-        # else: 不设置具体参数，使用默认值
         
         # 调用 Gemini 原生 API（流式）
         response = client.models.generate_content_stream(
@@ -294,7 +285,6 @@ def get_response(client, text_prompt: str, pil_image: Image.Image, model: str, k
                 if not part.text:
                     continue
                 
-                # 判断是思考内容还是回答内容
                 if part.thought:  # 思考内容
                     if len(reasoning_content) < 20000:
                         reasoning_content += part.text
@@ -306,7 +296,6 @@ def get_response(client, text_prompt: str, pil_image: Image.Image, model: str, k
         answer = answer_content.strip()
         reasoning = reasoning_content.strip()
         
-        # 检查响应是否为空
         if not answer:
             return "API Error: Empty response from API", False, False, ""
         
@@ -314,7 +303,6 @@ def get_response(client, text_prompt: str, pil_image: Image.Image, model: str, k
         
     except Exception as e:
         error_str = str(e)
-        # 记录到日志文件
         log_and_print(f"[Key-{key_id}] API错误 ({model}): {error_str}", level='warning')
         
         # 识别RPD配额耗尽
@@ -334,16 +322,13 @@ def get_response(client, text_prompt: str, pil_image: Image.Image, model: str, k
 
 
 def process_with_key(api_key, key_id, task_queue, pbar):
-    """
-    每个 API Key 对应的工作线程
-    """
+    """每个 API Key 对应的工作线程"""
     global active_threads
     
     client = get_client(api_key)
     current_model_index = 0
     consecutive_failures = 0
     
-    # 线程启动 - 增加活跃线程计数
     with active_threads_lock:
         active_threads += 1
         current_active = active_threads
@@ -351,7 +336,6 @@ def process_with_key(api_key, key_id, task_queue, pbar):
     log_and_print(f"🔑 Key-{key_id} 启动（当前活跃线程: {current_active}）", console=True)
     
     while True:
-        # 检查是否需要优雅退出
         if stop_flag:
             log_and_print(f"[Key-{key_id}] 接收到停止信号，优雅退出", console=True)
             break
@@ -360,12 +344,10 @@ def process_with_key(api_key, key_id, task_queue, pbar):
         task_acquired = False
         
         try:
-            # 检查是否达到失败阈值
             if consecutive_failures >= THREAD_FAILURE_THRESHOLD:
                 log_and_print(f"💀 [Key-{key_id}] 连续失败 {consecutive_failures} 次，关闭线程", console=True)
                 break
             
-            # 从队列获取任务
             try:
                 task = task_queue.get(timeout=0.1)
                 task_acquired = True
@@ -374,44 +356,64 @@ def process_with_key(api_key, key_id, task_queue, pbar):
             
             img_path = task['img_path']
             img_name = task['img_name']
+            target_word = task['target_word']
             strat_name = task['strat_name']
             prompt_text = task['prompt_text']
             repeat_index = task['repeat_index']
             
-            # 检查文件是否已存在
-            file_prefix = f"{safe_file_name(img_path.stem)}_{strat_name}_{repeat_index}_gemini2.5-flash"
-            existing_files = list(OUT_DIR.glob(f"{file_prefix}_*.txt"))
+            # 从图片文件名中提取 method 标记（methodA/methodB）
+            img_stem = img_path.stem
+            method_suffix = ""
+            method_name = ""  # 用于创建目录
+            
+            # 检查是否包含 _methodX 格式
+            if "_method" in img_stem:
+                parts = img_stem.split("_")
+                for i, part in enumerate(parts):
+                    if part.startswith("method"):
+                        method_suffix = f"_{part}"
+                        method_name = part  # 提取 methodA 或 methodB
+                        # 重建不包含 method 的文件名
+                        img_stem = "_".join(parts[:i] + parts[i+1:])
+                        break
+            
+            # 创建按 method 和 target 分类的目录结构
+            if method_name:
+                target_dir = OUT_DIR / method_name / target_word
+            else:
+                target_dir = OUT_DIR / target_word
+            
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+            file_prefix = f"{safe_file_name(img_stem)}_{strat_name}_{repeat_index}_gemini2.5-flash{method_suffix}"
+            existing_files = list(target_dir.glob(f"{file_prefix}_*.txt"))
             
             if existing_files:
-                log_and_print(f"[Key-{key_id}] 跳过: {img_name} | {strat_name} | 第{repeat_index}次 (已存在)")
+                log_and_print(f"[Key-{key_id}] 跳过: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次 (已存在)")
                 with stats_lock:
                     stats['skipped'] += 1
                 pbar.update(1)
                 task_queue.task_done()
                 continue
             
-            # 加载图片（使用 try-finally 确保关闭）
+            # 加载图片
             pil_image = None
             try:
                 pil_image = image_path_to_pil(img_path)
                 
-                # 获取当前使用的模型
                 current_model = MODELS[current_model_index]
                 
-                # 调用 API
-                log_and_print(f"[Key-{key_id}|{current_model}] 开始: {img_name} | {strat_name} | 第{repeat_index}次")
+                log_and_print(f"[Key-{key_id}|{current_model}] 开始: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次")
                 start_t = time.time()
                 answer, should_switch_model, is_quota_exhausted, reasoning = get_response(
                     client, prompt_text, pil_image, current_model, key_id
                 )
                 duration = time.time() - start_t
             finally:
-                # 确保图片资源被释放
                 if pil_image is not None:
                     pil_image.close()
             
             
-            # 检查是否是API错误
             if answer.startswith("API Error:"):
                 # RPD配额耗尽
                 if is_quota_exhausted:
@@ -420,11 +422,12 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                         console=True
                     )
                     
+                    time.sleep(10)
                     old_model = current_model
                     current_model_index = (current_model_index + 1) % len(MODELS)
                     new_model = MODELS[current_model_index]
                     
-                    if current_model_index == 0:
+                    if current_model_index == -1:
                         log_and_print(
                             f"✅ [Key-{key_id}] 所有模型配额已用完，线程优雅退出",
                             console=True
@@ -464,24 +467,20 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                 log_and_print(f"[Key-{key_id}] 任务成功，重置失败计数器 ({consecutive_failures} → 0)")
             consecutive_failures = 0
             
-            # 生成文件名
             time_str = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
             file_name = f"{file_prefix}_{time_str}.txt"
-            out_path = OUT_DIR / file_name
+            out_path = target_dir / file_name
             
-            # 填充模板
             context_snippet = prompt_text[:200] + "..." if len(prompt_text) > 200 else prompt_text
             full_content = EVAL_TEMPLATE.replace("[PROMPT_CONTEXT]", context_snippet).replace("[MASK]", answer)
             
-            # 将思考过程追加到文件末尾（与 Qwen 脚本格式完全一致）
             if reasoning:
-                # 清理 reasoning 中的重复 JSON 代码块（特别针对 JSON 策略）
                 cleaned_reasoning = clean_reasoning_content(reasoning)
                 full_content += "\n\n=== Thinking Process ===\n" + cleaned_reasoning
             
             out_path.write_text(full_content, encoding='utf-8')
             
-            log_and_print(f"[Key-{key_id}] ✅ 完成: {img_name} | {strat_name} | 第{repeat_index}次 ({duration:.2f}s)")
+            log_and_print(f"[Key-{key_id}] ✅ 完成: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次 ({duration:.2f}s)")
             
             with stats_lock:
                 stats['completed'] += 1
@@ -489,7 +488,6 @@ def process_with_key(api_key, key_id, task_queue, pbar):
             pbar.update(1)
             task_queue.task_done()
             
-            # 成功后sleep
             sleep_time = random.uniform(SUCCESS_SLEEP_MIN, SUCCESS_SLEEP_MAX)
             log_and_print(f"[Key-{key_id}] 等待 {sleep_time:.1f} 秒...")
             time.sleep(sleep_time)
@@ -510,7 +508,6 @@ def process_with_key(api_key, key_id, task_queue, pbar):
                 
                 task_queue.task_done()
     
-    # 线程结束 - 减少活跃线程计数
     with active_threads_lock:
         active_threads -= 1
         remaining = active_threads
@@ -522,12 +519,9 @@ def main():
     """主函数"""
     global stop_flag
     
-    # 设置优雅退出信号处理器
     def signal_handler(sig, frame):
-        global stop_flag
-        print("\n\n⚠️  接收到中断信号 (Ctrl+C)，正在优雅退出...")
-        print("    等待当前任务完成后停止线程...")
-        stop_flag = True
+        print("\n\n⚠️  接收到中断信号 (Ctrl+C)，立即退出...")
+        os._exit(0)  # 强制立即退出，不等待线程
     
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -537,7 +531,6 @@ def main():
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    # 初始化日志系统
     log_file = setup_logging(OUT_DIR)
     
     images = [p for p in PIC_DIR.iterdir() if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}]
@@ -546,10 +539,10 @@ def main():
         print("⚠️  未找到任何图片")
         return
     
-    # 计算总任务数
-    total_tasks = len(images) * len(STRATEGIES) * REPEAT_TIMES
+    total_tasks = len(images) * 2 * REPEAT_TIMES  # 5 个策略
     
-    print(f"[*] 发现 {len(images)} 张图片，准备测试 {len(STRATEGIES)} 种策略。")
+    print(f"[*] 发现 {len(images)} 张图片")
+    print(f"[*] 支持的目标词汇: {', '.join(prompt_strategies.TARGET_CONTEXTS.keys())}")
     print(f"[*] 每个策略重复 {REPEAT_TIMES} 次")
     print(f"[*] 模型策略: {MODELS}")
     print(f"[*] API Keys 数量: {len(GEMINI_API_KEYS)}")
@@ -557,16 +550,30 @@ def main():
     print(f"[*] 总计任务数: {total_tasks}")
     print(f"[*] 输出目录: {OUT_DIR}\n")
     
-    # 创建任务队列
+    # 统计Method文件夹中的txt文件数量
+    if OUT_DIR.exists():
+        method_dirs = [d for d in OUT_DIR.iterdir() if d.is_dir() and d.name.startswith('method')]
+        if method_dirs:
+            for method_dir in sorted(method_dirs):
+                txt_count = len(list(method_dir.rglob('*.txt')))
+                print(f"[*] {method_dir.name} 文件夹中有 {txt_count} 个txt文件")
+        else:
+            print(f"[*] 未发现任何Method文件夹")
+    print()
+    
     task_queue = queue.Queue()
     
     print("正在构建任务队列...")
     for img in images:
+        target_word = extract_target_from_filename(img.stem)
+        STRATEGIES = get_strategies_for_target(target_word)
+        
         for strat_name, prompt_text in STRATEGIES.items():
             for i in range(REPEAT_TIMES):
                 task_queue.put({
                     'img_path': img,
                     'img_name': img.name,
+                    'target_word': target_word,
                     'strat_name': strat_name,
                     'prompt_text': prompt_text,
                     'repeat_index': i + 1
@@ -575,16 +582,22 @@ def main():
     print(f"任务队列已构建，共 {task_queue.qsize()} 个任务\n")
     print(f"[*] 线程失败阈值: {THREAD_FAILURE_THRESHOLD} 次连续失败\n")
     
-    # 创建进度条
     pbar = tqdm(total=total_tasks, unit="任务", desc="进度", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
     
-    # 启动线程池
     with ThreadPoolExecutor(max_workers=len(GEMINI_API_KEYS)) as executor:
         futures = []
         for i, api_key in enumerate(GEMINI_API_KEYS):
             futures.append(executor.submit(process_with_key, api_key, i, task_queue, pbar))
         
-        # 等待所有线程完成
+        # 主线程循环等待，确保能响应 Ctrl+C 信号
+        try:
+            while any(not f.done() for f in futures):
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  接收到中断信号 (Ctrl+C)，立即退出...")
+            os._exit(0)
+
+        # 检查任务结果
         for future in futures:
             try:
                 future.result()
@@ -593,10 +606,8 @@ def main():
     
     pbar.close()
     
-    # 检查剩余任务
     remaining_tasks = task_queue.qsize()
     
-    # 输出统计信息
     print(f"\n{'='*60}")
     print(f"执行统计:")
     print(f"{'='*60}")

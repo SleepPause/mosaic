@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量文本评估脚本 - CLI2API 多线程版本
+批量文本评估脚本 - CLI2API 单线程递归版本
 使用 OpenAI 兼容模式通过 Gemini Manager 代理调用 Gemini API
-支持多个代理端口并发处理
+遍历 eval_text 下的每个子目录，在每个目录内生成独立的 Excel 结果文件
 """
 import os
 from pathlib import Path
@@ -12,13 +12,10 @@ import json
 import pandas as pd
 from openai import OpenAI
 from tqdm import tqdm
-import threading
-import queue
-from concurrent.futures import ThreadPoolExecutor
 
 # ========= 配置区域 =========
-# Gemini Manager 代理端口列表（每个线程使用一个端口）
-GEMINI_MANAGER_PORTS = ["4000"]
+# Gemini Manager 代理端口 (单线程只用一个)
+GEMINI_MANAGER_PORT = "4000"
 GEMINI_MANAGER_PASSWORD = "123456"  # 请修改为你的密码
 
 # 模型配置
@@ -30,22 +27,9 @@ MAX_CHARS_PER_BATCH = 500000
 
 # 基础目录
 BASE_DIR = Path(__file__).parent
-INPUT_FOLDER = BASE_DIR / "eval_text"
-# OUTPUT_FILE 将在 main 函数中根据已有文件动态确定
-OUTPUT_FILE = None
+EVAL_TEXT_DIR = BASE_DIR / "eval_text"
 
 # ================================
-
-# 线程安全锁
-save_lock = threading.Lock()
-print_lock = threading.Lock()
-
-
-def safe_print(msg):
-    """线程安全的打印函数"""
-    with print_lock:
-        tqdm.write(msg)
-
 
 def get_client(port):
     """获取 OpenAI 客户端（连接到 Gemini Manager）"""
@@ -125,12 +109,7 @@ def parse_json_response(response_text, original_batch_filenames):
 
 
 def call_api(client, prompt, model):
-    """
-    调用 Gemini API
-    
-    Returns:
-        (response_text, success): 响应文本和是否成功的标志
-    """
+    """调用 Gemini API"""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -168,192 +147,63 @@ def call_api(client, prompt, model):
         return f"API Error: {str(e)}", False
 
 
-def process_with_thread(thread_id, port, task_queue, pbar, results_list):
-    """
-    线程工作函数
+def process_directory(target_dir: Path):
+    """处理单个目录"""
+    print(f"\n{'='*60}")
+    print(f"📂 进入目录: {target_dir}")
+    print(f"{'='*60}")
     
-    Args:
-        thread_id: 线程ID
-        port: Gemini Manager 端口号
-        task_queue: 任务队列
-        pbar: 进度条
-        results_list: 结果列表（线程安全）
-    """
-    client = get_client(port)
-    safe_print(f"🔑 Thread-{thread_id} 启动 (Port: {port})")
-    
-    while True:
-        try:
-            # 从队列获取批次任务
-            try:
-                batch_task = task_queue.get(timeout=0.1)
-            except queue.Empty:
-                break
-            
-            batch_data = batch_task['batch_data']
-            batch_filenames = batch_task['batch_filenames']
-            
-            # 处理当前批次
-            safe_print(f"[Thread-{thread_id}] 正在处理批次: {len(batch_data)} 个文件")
-            user_prompt = build_batch_prompt(batch_data)
-            
-            # 调用 API
-            response_text, success = call_api(client, user_prompt, MODEL)
-            
-            if success:
-                # 解析结果
-                parsed_items = parse_json_response(response_text, batch_filenames)
-                
-                # 构建结果条目
-                batch_results = []
-                for fname, item in zip(batch_filenames, parsed_items):
-                    res_entry = {
-                        "文件名": fname,
-                        "Verdict": item['verdict'],
-                        "Score": item['score'],
-                        "Reasoning": item['reasoning'],
-                        "Raw Response": item['raw_json']
-                    }
-                    batch_results.append(res_entry)
-                
-                # 线程安全地保存结果
-                save_success = False
-                with save_lock:
-                    results_list.extend(batch_results)
-                    
-                    # 实时保存到 Excel（使用临时文件）
-                    temp_file = OUTPUT_FILE.parent / f"{OUTPUT_FILE.stem}_temp.xlsx"
-                    try:
-                        df = pd.DataFrame(results_list)
-                        df = df[["文件名", "Verdict", "Score", "Reasoning", "Raw Response"]]
-                        # 先写入临时文件
-                        df.to_excel(temp_file, index=False)
-                        # 成功后替换原文件
-                        if temp_file.exists():
-                            temp_file.replace(OUTPUT_FILE)
-                        save_success = True
-                    except Exception as e:
-                        safe_print(f"⚠️ [Thread-{thread_id}] 保存 Excel 失败: {e}")
-                        if temp_file.exists():
-                            try:
-                                temp_file.unlink()
-                            except:
-                                pass
-                
-                # 更新进度条
-                pbar.update(len(batch_data))
-                
-                save_status = "✓" if save_success else "✗"
-                safe_print(f"  ✅ [Thread-{thread_id}] 批次处理成功 ({len(batch_data)} 文件) [保存: {save_status}]")
-                
-                # 标记任务完成
-                task_queue.task_done()
-                
-                # 成功后等待
-                time.sleep(10)
-            else:
-                # API 调用失败，重新入队
-                safe_print(f"  ❌ [Thread-{thread_id}] API 调用失败: {response_text[:200]}")
-                safe_print(f"  ⏸️ [Thread-{thread_id}] 等待 60 秒后重试...")
-                
-                # 将批次放回队列
-                task_queue.put(batch_task)
-                task_queue.task_done()
-                
-                time.sleep(60)
-                
-        except Exception as e:
-            safe_print(f"❌ [Thread-{thread_id}] 线程异常: {e}")
-            import traceback
-            safe_print(f"   Traceback: {traceback.format_exc()}")
-            
-            # 尝试将任务放回队列
-            try:
-                if 'batch_task' in locals():
-                    task_queue.put(batch_task)
-            except:
-                pass
-            
-            task_queue.task_done()
-            break
-    
-    safe_print(f"🏁 Thread-{thread_id} 任务结束")
-
-
-def main():
-    global OUTPUT_FILE
-    
-    if not INPUT_FOLDER.exists():
-        print(f"错误: 文件夹 '{INPUT_FOLDER}' 不存在。")
-        return
-
-    all_files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith('.txt')]
+    all_files = [f for f in os.listdir(target_dir) if f.endswith('.txt')]
     if not all_files:
-        print("文件夹内没有找到 .txt 文件。")
+        print("   ⚠️  无 .txt 文件，跳过。")
         return
 
-    print(f"[*] 找到 {len(all_files)} 个 txt 文件。")
-    
-    # 检查已处理的文件（查找所有 gemini_batch_results 开头的 Excel 文件）
+    # 确定输出文件
+    # 查找最新的 gemini_batch_results*.xlsx
+    existing_excel_files = list(target_dir.glob("gemini_batch_results*.xlsx"))
+    output_file = None
+    results_list = []
     processed_files = set()
-    existing_excel_files = list(INPUT_FOLDER.glob("gemini_batch_results*.xlsx"))
     
     if existing_excel_files:
-        # 找到最新的Excel文件
-        OUTPUT_FILE = max(existing_excel_files, key=lambda f: f.stat().st_mtime)
-        print(f"[*] 发现已有结果文件: {OUTPUT_FILE.name}，将在此文件后追加新数据")
-        
+        output_file = max(existing_excel_files, key=lambda f: f.stat().st_mtime)
+        print(f"   📄 发现已有结果文件: {output_file.name}")
         try:
-            df_existing = pd.read_excel(OUTPUT_FILE)
+            df_existing = pd.read_excel(output_file)
             if "文件名" in df_existing.columns:
                 processed_files = set(df_existing["文件名"].dropna().tolist())
-                print(f"[*] 已处理文件数: {len(processed_files)}")
+                # 加载已有数据以保持完整性
+                for _, row in df_existing.iterrows():
+                    results_list.append({
+                        "文件名": row.get("文件名", ""),
+                        "Verdict": row.get("Verdict", ""),
+                        "Score": row.get("Score", 0),
+                        "Reasoning": row.get("Reasoning", ""),
+                        "Raw Response": row.get("Raw Response", "")
+                    })
+                print(f"   ✅ 已处理文件数: {len(processed_files)}")
             else:
-                print(f"[!] 警告: Excel文件中没有'文件名'列，将处理所有文件。")
+                print(f"   ⚠️  警告: Excel文件中没有'文件名'列。")
         except Exception as e:
-            print(f"[!] 读取已有Excel失败: {e}，将处理所有文件。")
+            print(f"   ❌ 读取已有Excel失败: {e}")
     else:
-        # 创建新文件
-        OUTPUT_FILE = INPUT_FOLDER / f"gemini_batch_results_cli2api_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-        print(f"[*] 未发现已有结果文件，将创建新文件: {OUTPUT_FILE.name}")
-    
-    # 过滤出未处理的文件
-    files_to_process = [f for f in all_files if f not in processed_files]
-    
-    if not files_to_process:
-        print("所有文件均已处理完毕，无需继续。")
-        return
-    
-    print(f"[*] 跳过已处理文件: {len(processed_files)} 个")
-    print(f"[*] 待处理文件: {len(files_to_process)} 个")
-    print(f"[*] 使用模型: {MODEL}")
-    print(f"[*] 并发线程数: {len(GEMINI_MANAGER_PORTS)}")
-    print(f"[*] 代理端口: {', '.join(GEMINI_MANAGER_PORTS)}")
-    print(f"[*] 输出文件: {OUTPUT_FILE}\n")
+        output_file = target_dir / f"gemini_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        print(f"   🆕 创建新结果文件: {output_file.name}")
 
-    # 加载已有数据
-    results_list = []
-    if OUTPUT_FILE.exists():
-        try:
-            df_existing = pd.read_excel(OUTPUT_FILE)
-            for _, row in df_existing.iterrows():
-                results_list.append({
-                    "文件名": row.get("文件名", ""),
-                    "Verdict": row.get("Verdict", ""),
-                    "Score": row.get("Score", 0),
-                    "Reasoning": row.get("Reasoning", ""),
-                    "Raw Response": row.get("Raw Response", "")
-                })
-            print(f"[*] 已加载 {len(results_list)} 条已有记录\n")
-        except Exception as e:
-            print(f"[!] 加载已有数据失败: {e}，将从空列表开始\n")
+    # 过滤待处理文件
+    files_to_process = [f for f in all_files if f not in processed_files]
+    if not files_to_process:
+        print("   ✨ 所有文件均已处理完毕。")
+        return
+
+    print(f"   🚀 待处理文件: {len(files_to_process)} 个")
     
-    # 构建批次任务队列
-    print("正在构建批次任务队列...")
-    task_queue = queue.Queue()
+    # 准备 API 客户端
+    client = get_client(GEMINI_MANAGER_PORT)
     
+    # 构建批次并处理
     file_index = 0
-    total_batches = 0
+    pbar = tqdm(total=len(files_to_process), unit="file", desc="   进度")
     
     while file_index < len(files_to_process):
         # 构建当前批次
@@ -363,10 +213,9 @@ def main():
         
         while len(batch_data) < MAX_FILES_PER_BATCH and file_index < len(files_to_process):
             fname = files_to_process[file_index]
-            path = INPUT_FOLDER / fname
+            path = target_dir / fname
             
             try:
-                # 读取文件内容
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read()
@@ -376,9 +225,7 @@ def main():
                 
                 file_len = len(content)
                 
-                # 检查是否超过字符限制
                 if current_batch_chars + file_len > MAX_CHARS_PER_BATCH and len(batch_data) > 0:
-                    # 当前批次已满，不再添加
                     break
                 
                 batch_data.append((fname, content))
@@ -387,38 +234,111 @@ def main():
                 file_index += 1
                 
             except Exception as e:
-                print(f"\n读取文件 {fname} 失败: {e}")
+                print(f"\n   ❌ 读取文件 {fname} 失败: {e}")
                 file_index += 1
         
-        if batch_data:
-            task_queue.put({
-                'batch_data': batch_data,
-                'batch_filenames': batch_filenames
-            })
-            total_batches += 1
-    
-    print(f"任务队列已构建，共 {total_batches} 个批次，{len(files_to_process)} 个文件\n")
-    
-    # 创建进度条
-    pbar = tqdm(total=len(files_to_process), unit="file", desc="处理进度")
-    
-    # 启动线程池
-    with ThreadPoolExecutor(max_workers=len(GEMINI_MANAGER_PORTS)) as executor:
-        futures = []
-        for i, port in enumerate(GEMINI_MANAGER_PORTS):
-            futures.append(executor.submit(
-                process_with_thread, i, port, task_queue, pbar, results_list
-            ))
+        if not batch_data:
+            continue
+            
+        # 处理批次
+        user_prompt = build_batch_prompt(batch_data)
         
-        # 等待所有线程完成
-        for future in futures:
+        # 简单的重试机制
+        retry_count = 0
+        max_retries = 3
+        current_batch_success = False
+        
+        while retry_count < max_retries:
+            response_text, success = call_api(client, user_prompt, MODEL)
+            
+            if success:
+                parsed_items = parse_json_response(response_text, batch_filenames)
+                
+                # 保存结果
+                batch_results_to_save = []
+                for fname_res, item in zip(batch_filenames, parsed_items):
+                    res_entry = {
+                        "文件名": fname_res,
+                        "Verdict": item['verdict'],
+                        "Score": item['score'],
+                        "Reasoning": item['reasoning'],
+                        "Raw Response": item['raw_json']
+                    }
+                    batch_results_to_save.append(res_entry)
+                
+                results_list.extend(batch_results_to_save)
+                
+                # 写入 Excel
+                try:
+                    df = pd.DataFrame(results_list)
+                    df = df[["文件名", "Verdict", "Score", "Reasoning", "Raw Response"]]
+                    df.to_excel(output_file, index=False)
+                except Exception as e:
+                    print(f"\n   ❌ 保存 Excel 失败: {e}")
+                
+                pbar.update(len(batch_data))
+                current_batch_success = True
+                # 成功后稍作休息，避免速率限制
+                time.sleep(2) 
+                break
+            else:
+                retry_count += 1
+                print(f"\n   ⚠️ API 调用失败 (重试 {retry_count}/{max_retries}): {response_text[:100]}...")
+                time.sleep(5) # 失败等待
+        
+        if not current_batch_success:
+            print(f"\n   ❌ 批次处理彻底失败，跳过 {len(batch_filenames)} 个文件")
+            # 在结果中标记错误，防止死循环或丢失进度
+            for fname_err in batch_filenames:
+                 results_list.append({
+                        "文件名": fname_err,
+                        "Verdict": "Error",
+                        "Score": 0,
+                        "Reasoning": "Max retries exceeded",
+                        "Raw Response": "N/A"
+                    })
+            # 尝试保存错误记录
             try:
-                future.result()
-            except Exception as e:
-                print(f"线程异常: {e}")
-    
+                df = pd.DataFrame(results_list)
+                df.to_excel(output_file, index=False)
+            except:
+                pass
+            pbar.update(len(batch_filenames))
+
     pbar.close()
-    print(f"\n全部完成！最终结果已保存到: {OUTPUT_FILE}")
+    print(f"   🏁 目录处理完成。")
+
+
+def main():
+    if not EVAL_TEXT_DIR.exists():
+        print(f"❌ 目录 '{EVAL_TEXT_DIR}' 不存在。")
+        return
+    
+    print(f"🚀 开始遍历目录: {EVAL_TEXT_DIR}")
+    print(f"🤖 模型: {MODEL}")
+    print(f"📦 Batch 大小: {MAX_FILES_PER_BATCH}")
+    
+    # 递归遍历所有子目录
+    # os.walk 会返回 (root, dirs, files)
+    # 我们只需要关注 root，看它里面有没有 .txt
+    
+    target_directories = []
+    for root, dirs, files in os.walk(EVAL_TEXT_DIR):
+        has_txt = any(f.endswith('.txt') for f in files)
+        if has_txt:
+            target_directories.append(Path(root))
+            
+    if not target_directories:
+        print("未找到任何包含 .txt 文件的目录。")
+        return
+        
+    print(f"🎯 共发现 {len(target_directories)} 个待处理目录")
+    
+    for i, target_dir in enumerate(target_directories, 1):
+        print(f"\n[{i}/{len(target_directories)}] 正在处理目录...")
+        process_directory(target_dir)
+        
+    print("\n✅ 所有目录处理完毕！")
 
 
 if __name__ == "__main__":

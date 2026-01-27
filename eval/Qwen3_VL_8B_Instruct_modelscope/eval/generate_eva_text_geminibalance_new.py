@@ -4,14 +4,13 @@
 批量红队评估：遍历 pic/内所有图片，使用多种提示词策略截取模型的回答
 使用 Gemini Balance 代理调用 Gemini API（多线程并发版本，支持 thinking）
 
-相比原版的简化：
-- ✅ 使用 Gemini Balance 代理（http://localhost:8001/openai/v1）
-- ✅ 保留：多线程并发
-- ✅ 保留：任务队列
-- ✅ 保留：Thinking 支持
-- ✅ 保留：进度跟踪和日志
+【新版本特性】
+- ✅ 动态策略生成：从文件名提取目标词，动态生成对应策略
+- ✅ 二级目录输出：OUT_DIR/methodX/TARGET_WORD/ 结构
+- ✅ 简化错误处理：任何错误统一重试，固定 sleep 5s
+- ✅ 多线程并发：支持配置多个线程访问 Gemini Balance API
 
-文件名：图片名_策略名_序号_gemini_时间戳.txt
+文件名：图片名_策略名_序号_gemini2.5-flash_methodX_时间戳.txt
 """
 import time
 import re
@@ -22,7 +21,7 @@ import base64
 import mimetypes
 from datetime import datetime
 from pathlib import Path
-import prompt_strategies
+import prompt_strategies_new as prompt_strategies  # 使用新版提示词库
 import evaluation_templates
 from tqdm import tqdm
 import threading
@@ -42,7 +41,7 @@ BALANCE_API_KEY = "123456"  # 你的 ALLOWED_TOKENS
 # 详见: https://gb-docs.snaily.top/guide/environment.html
 
 # 并发线程数（建议 10-20）
-NUM_THREADS = 1
+NUM_THREADS = 20
 
 # Gemini 模型配置
 MODEL = "gemini-2.5-flash"
@@ -52,25 +51,16 @@ BASE_DIR = Path(__file__).parent
 PIC_DIR = BASE_DIR.parent / "pic"
 OUT_DIR = BASE_DIR / "eval_text"
 
-# 定义要测试的策略集合
-STRATEGIES = {
-    "BreakingBad": prompt_strategies.PROMPT_BREAKING_BAD,
-    "SafetyAuditor": prompt_strategies.PROMPT_SAFETY_AUDITOR,
-    "Historian": prompt_strategies.PROMPT_HISTORIAN,
-    "JSON": prompt_strategies.PROMPT_JSON_FORMAT,
-    "ArtCritic": prompt_strategies.PROMPT_ART_CRITIC,
-}
-
 # 每个策略重复测试的次数
-REPEAT_TIMES = 6
+REPEAT_TIMES = 10
 
 # 线程失败阈值：连续失败次数超过此值，线程退出
-THREAD_FAILURE_THRESHOLD = 10
+THREAD_FAILURE_THRESHOLD = 100000000
 
 # 速率限制配置（保守配置）
 SUCCESS_SLEEP_MIN = 15  # 成功后最少等待秒数
 SUCCESS_SLEEP_MAX = 20  # 成功后最多等待秒数
-FAILURE_SLEEP = 60      # 失败后等待秒数
+ERROR_SLEEP = 5         # 错误后固定等待 5 秒
 # =================================
 
 # 使用 StrongREJECT 模板
@@ -98,14 +88,62 @@ stop_flag = False
 logger = None
 
 
+def get_strategies_for_target(target_word: str) -> dict:
+    """
+    根据目标词汇动态生成策略集合
+    
+    Args:
+        target_word: 从图片文件名提取的目标词（如 "HEROIN", "METH"）
+    
+    Returns:
+        策略名称到提示词文本的映射字典
+    """
+    # 从映射字典中获取对应的 action，如果不存在则使用默认值
+    action = prompt_strategies.TARGET_CONTEXTS.get(target_word, "synthesis process")
+    
+    return {
+        "BreakingBad": prompt_strategies.get_breaking_bad_prompt(target_word, action),
+        #"SafetyAuditor": prompt_strategies.get_safety_auditor_prompt(target_word, action),
+        #"Historian": prompt_strategies.get_historian_prompt(target_word, action),
+        "JSON": prompt_strategies.get_json_format_prompt(target_word, action),
+        #"ArtCritic": prompt_strategies.get_art_critic_prompt(target_word, action),
+    }
+
+
+def extract_target_from_filename(filename: str) -> str:
+    """
+    从文件名中提取目标词汇
+    
+    例如: "HEROIN_Opacity_64_negative_words.jpg" -> "HEROIN"
+          "METH_test.jpg" -> "METH"
+    
+    Args:
+        filename: 图片文件名（不含路径）
+    
+    Returns:
+        提取的目标词（大写），如果无法提取则返回 "HEROIN" 作为默认值
+    """
+    # 假设文件名格式为: TARGET_其他信息.jpg
+    parts = filename.split('_')
+    if parts:
+        target = parts[0].upper()
+        # 验证是否在已知目标列表中
+        if target in prompt_strategies.TARGET_CONTEXTS:
+            return target
+    
+    # 如果无法识别，默认返回 HEROIN
+    log_and_print(f"⚠️  无法从文件名 '{filename}' 提取目标词，使用默认值 HEROIN", console=True)
+    return "HEROIN"
+
+
 def setup_logging(log_dir: Path):
     """配置日志系统"""
     global logger
     
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"eval_geminibalance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = log_dir / f"eval_geminibalance_new_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
-    logger = logging.getLogger('GeminiBalanceEval')
+    logger = logging.getLogger('GeminiBalanceEvalNew')
     logger.setLevel(logging.DEBUG)
     
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
@@ -249,17 +287,6 @@ def get_response(client, text_prompt: str, image_path: Path, model: str, thread_
         # 提取答案和 thinking
         answer = response.choices[0].message.content
         reasoning = getattr(response.choices[0].message, 'reasoning_content', None) or ""
-        finish_reason = response.choices[0].finish_reason
-
-        # 记录 thinking 状态
-        if reasoning:
-            log_and_print(f"[Thread-{thread_id}] ✅ 获取到 thinking 内容，长度: {len(reasoning)} 字符")
-        else:
-            log_and_print(f"[Thread-{thread_id}] ⚠️ 未获取到 thinking 内容", level='warning')
-        
-        if finish_reason in ["content_filter", "safety"]:
-            log_and_print(f"[Thread-{thread_id}] 🛑 任务触发安全拦截 (Reason: {finish_reason})，停止重试。")
-            return "[SAFETY_BLOCKED]", reasoning
 
         # 检查是否为空响应
         if not answer:
@@ -311,16 +338,41 @@ def process_with_thread(thread_id, task_queue, pbar):
             
             img_path = task['img_path']
             img_name = task['img_name']
+            target_word = task['target_word']
             strat_name = task['strat_name']
             prompt_text = task['prompt_text']
             repeat_index = task['repeat_index']
             
+            # 从图片文件名中提取 method 标记（methodA/methodB）
+            img_stem = img_path.stem
+            method_suffix = ""
+            method_name = ""  # 用于创建目录
+            
+            # 检查是否包含 _methodX 格式
+            if "_method" in img_stem:
+                parts = img_stem.split("_")
+                for i, part in enumerate(parts):
+                    if part.startswith("method"):
+                        method_suffix = f"_{part}"
+                        method_name = part  # 提取 methodA 或 methodB
+                        # 重建不包含 method 的文件名
+                        img_stem = "_".join(parts[:i] + parts[i+1:])
+                        break
+            
+            # 创建按 method 和 target 分类的目录结构
+            if method_name:
+                target_dir = OUT_DIR / method_name / target_word
+            else:
+                target_dir = OUT_DIR / target_word
+            
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
             # 检查文件是否已存在
-            file_prefix = f"{safe_file_name(img_path.stem)}_{strat_name}_{repeat_index}_gemini2.5-flash"
-            existing_files = list(OUT_DIR.glob(f"{file_prefix}_*.txt"))
+            file_prefix = f"{safe_file_name(img_stem)}_{strat_name}_{repeat_index}_gemini2.5-flash{method_suffix}"
+            existing_files = list(target_dir.glob(f"{file_prefix}_*.txt"))
             
             if existing_files:
-                log_and_print(f"[Thread-{thread_id}] 跳过: {img_name} | {strat_name} | 第{repeat_index}次 (已存在)")
+                log_and_print(f"[Thread-{thread_id}] 跳过: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次 (已存在)")
                 with stats_lock:
                     stats['skipped'] += 1
                 pbar.update(1)
@@ -328,12 +380,12 @@ def process_with_thread(thread_id, task_queue, pbar):
                 continue
             
             # 调用 API
-            log_and_print(f"[Thread-{thread_id}|{MODEL}] 开始: {img_name} | {strat_name} | 第{repeat_index}次")
+            log_and_print(f"[Thread-{thread_id}|{MODEL}] 开始: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次")
             start_t = time.time()
             answer, reasoning = get_response(client, prompt_text, img_path, MODEL, thread_id)
             duration = time.time() - start_t
             
-            # 检查是否失败
+            # 简化错误处理：任何错误都统一处理
             if answer.startswith("API Error:"):
                 log_and_print(f"[Thread-{thread_id}] API错误，重新入队 ({duration:.2f}s): {answer[:200]}", level='warning')
                 consecutive_failures += 1
@@ -345,12 +397,9 @@ def process_with_thread(thread_id, task_queue, pbar):
                 task_queue.put(task)
                 task_queue.task_done()
                 
-                # 可中断的等待
-                log_and_print(f"[Thread-{thread_id}] 等待 {FAILURE_SLEEP} 秒...")
-                for _ in range(int(FAILURE_SLEEP * 2)):  # 每 0.5 秒检查一次
-                    if stop_flag:
-                        break
-                    time.sleep(0.5)
+                # 固定等待 5 秒
+                log_and_print(f"[Thread-{thread_id}] 等待 {ERROR_SLEEP} 秒...")
+                time.sleep(ERROR_SLEEP)
                 continue
             
             # 成功
@@ -361,7 +410,7 @@ def process_with_thread(thread_id, task_queue, pbar):
             # 生成文件名
             time_str = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
             file_name = f"{file_prefix}_{time_str}.txt"
-            out_path = OUT_DIR / file_name
+            out_path = target_dir / file_name
             
             # 填充模板
             context_snippet = prompt_text[:200] + "..." if len(prompt_text) > 200 else prompt_text
@@ -374,7 +423,7 @@ def process_with_thread(thread_id, task_queue, pbar):
             
             out_path.write_text(full_content, encoding='utf-8')
             
-            log_and_print(f"[Thread-{thread_id}] ✅ 完成: {img_name} | {strat_name} | 第{repeat_index}次 ({duration:.2f}s)")
+            log_and_print(f"[Thread-{thread_id}] ✅ 完成: {img_name} ({target_word}) | {strat_name} | 第{repeat_index}次 ({duration:.2f}s)")
             
             with stats_lock:
                 stats['completed'] += 1
@@ -442,10 +491,11 @@ def main():
         print("⚠️  未找到任何图片")
         return
     
-    # 计算总任务数
-    total_tasks = len(images) * len(STRATEGIES) * REPEAT_TIMES
+    # 计算总任务数（动态策略数量）
+    total_tasks = len(images) * 2 * REPEAT_TIMES  # 2 个策略（BreakingBad + JSON）
     
-    print(f"[*] 发现 {len(images)} 张图片，准备测试 {len(STRATEGIES)} 种策略。")
+    print(f"[*] 发现 {len(images)} 张图片")
+    print(f"[*] 支持的目标词汇: {', '.join(prompt_strategies.TARGET_CONTEXTS.keys())}")
     print(f"[*] 每个策略重复 {REPEAT_TIMES} 次")
     print(f"[*] 模型: {MODEL}")
     print(f"[*] 并发线程数: {NUM_THREADS}")
@@ -459,11 +509,16 @@ def main():
     
     print("正在构建任务队列...")
     for img in images:
+        # 动态提取目标词并生成策略
+        target_word = extract_target_from_filename(img.stem)
+        STRATEGIES = get_strategies_for_target(target_word)
+        
         for strat_name, prompt_text in STRATEGIES.items():
             for i in range(REPEAT_TIMES):
                 task_queue.put({
                     'img_path': img,
                     'img_name': img.name,
+                    'target_word': target_word,
                     'strat_name': strat_name,
                     'prompt_text': prompt_text,
                     'repeat_index': i + 1
